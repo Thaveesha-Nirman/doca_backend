@@ -2,9 +2,9 @@ require("dotenv").config();
 
 const app = require("./app");
 const { connectDatabase, disconnectDatabase } = require("./config/database");
+const { getServerConfig } = require("./config/env");
 
-const port = Number(process.env.PORT || 5000);
-const host = process.env.HOST || "0.0.0.0";
+const { host, mongodbUri, port } = getServerConfig();
 
 const server = app.listen(port, host, () => {
   console.log(`DOCA API listening on http://${host}:${port}`);
@@ -12,7 +12,7 @@ const server = app.listen(port, host, () => {
 
 async function connectToMongo() {
   try {
-    await connectDatabase(process.env.MONGODB_URI);
+    await connectDatabase(mongodbUri);
     console.log("MongoDB connected");
   } catch (error) {
     console.error(`MongoDB connection failed: ${error.message}`);

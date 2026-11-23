@@ -3,8 +3,10 @@ require("dotenv").config();
 const { connectDatabase, disconnectDatabase } = require("../config/database");
 const conditions = require("../data/conditions");
 const Condition = require("../models/condition.model");
+const { validateConditionCatalog } = require("../utils/catalog");
 
 async function seedConditions() {
+  validateConditionCatalog(conditions);
   await connectDatabase(process.env.MONGODB_URI);
 
   const operations = conditions.map((condition) => ({

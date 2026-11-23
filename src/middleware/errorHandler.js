@@ -5,7 +5,21 @@ function notFoundHandler(req, res, next) {
 }
 
 function errorHandler(error, req, res, next) {
-  const statusCode = error.statusCode || 500;
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  const suppliedStatus = error.statusCode || error.status;
+  const statusCode =
+    Number.isInteger(suppliedStatus) && suppliedStatus >= 400 && suppliedStatus <= 599
+      ? suppliedStatus
+      : 500;
+  const message =
+    error.type === "entity.parse.failed"
+      ? "Request body contains invalid JSON."
+      : statusCode === 500
+        ? "Internal server error"
+        : error.message;
 
   if (statusCode === 500) {
     console.error(error);
@@ -13,7 +27,7 @@ function errorHandler(error, req, res, next) {
 
   res.status(statusCode).json({
     status: "error",
-    message: statusCode === 500 ? "Internal server error" : error.message,
+    message,
   });
 }
 

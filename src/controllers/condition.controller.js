@@ -3,7 +3,9 @@ const mongoose = require("mongoose");
 const Condition = require("../models/condition.model");
 const { MEDICAL_DISCLAIMER } = require("../constants/medical");
 const ApiError = require("../utils/apiError");
+const { parsePagination, parseResultLimit } = require("../utils/query");
 const { buildConditionSearchFilter, normalizeSearchQuery } = require("../utils/search");
+const { isValidConditionSlug, normalizeConditionSlug } = require("../utils/slug");
 
 function requireDatabase() {
   if (mongoose.connection.readyState !== 1) {
@@ -11,15 +13,9 @@ function requireDatabase() {
   }
 }
 
-function parsePagination(query) {
-  const page = Math.max(Number.parseInt(query.page, 10) || 1, 1);
-  const limit = Math.min(Math.max(Number.parseInt(query.limit, 10) || 20, 1), 50);
-  return { page, limit, skip: (page - 1) * limit };
-}
-
 async function listConditions(req, res) {
-  requireDatabase();
   const { page, limit, skip } = parsePagination(req.query);
+  requireDatabase();
 
   const [conditions, total] = await Promise.all([
     Condition.find().sort({ name: 1 }).skip(skip).limit(limit).lean(),
@@ -34,8 +30,14 @@ async function listConditions(req, res) {
 }
 
 async function getConditionBySlug(req, res) {
+  const slug = normalizeConditionSlug(req.params.slug);
+
+  if (!isValidConditionSlug(slug)) {
+    throw new ApiError(400, "Condition slug is invalid.");
+  }
+
   requireDatabase();
-  const condition = await Condition.findOne({ slug: req.params.slug.toLowerCase() }).lean();
+  const condition = await Condition.findOne({ slug }).lean();
 
   if (!condition) {
     throw new ApiError(404, "Condition not found.");
@@ -45,14 +47,18 @@ async function getConditionBySlug(req, res) {
 }
 
 async function searchConditions(req, res) {
+  if (typeof req.query.q !== "string") {
+    throw new ApiError(400, "Query parameter q must contain at least 2 characters.");
+  }
+
   const query = normalizeSearchQuery(req.query.q);
 
   if (query.length < 2) {
     throw new ApiError(400, "Query parameter q must contain at least 2 characters.");
   }
 
+  const limit = parseResultLimit(req.query.limit);
   requireDatabase();
-  const limit = Math.min(Math.max(Number.parseInt(req.query.limit, 10) || 20, 1), 50);
   const conditions = await Condition.find(buildConditionSearchFilter(query))
     .sort({ name: 1 })
     .limit(limit)
