@@ -8,10 +8,20 @@ const notificationSchema = new mongoose.Schema(
     actorAvatarId: { type: String, default: "avatar_01" },
     type: {
       type: String,
-      enum: ["message_request", "request_accepted", "follow", "comment", "reply"],
+      enum: [
+        "message_request",
+        "request_accepted",
+        "message",
+        "follow",
+        "post_upvote",
+        "post_share",
+        "comment",
+        "reply",
+        "comment_upvote",
+      ],
       required: true,
     },
-    referenceId: { type: String, default: null }, // requestId, conversationId, or postId
+    referenceId: { type: String, default: null },
     message: { type: String, required: true, trim: true },
     isRead: { type: Boolean, default: false },
   },

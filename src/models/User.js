@@ -8,8 +8,9 @@ const userSchema = new mongoose.Schema(
     gender: { type: String, default: "Prefer not to say" },
     age: { type: Number, min: 13, max: 120 },
     bio: { type: String, default: "", trim: true, maxlength: 200 },
-    followers: { type: [String], default: [] }, // array of firebaseUids
-    following: { type: [String], default: [] }, // array of firebaseUids
+    followers: { type: [String], default: [] },
+    following: { type: [String], default: [] },
+    fcmTokens: { type: [String], default: [] },
   },
   { timestamps: true }
 );

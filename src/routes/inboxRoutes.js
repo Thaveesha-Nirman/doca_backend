@@ -5,12 +5,56 @@ const MessageRequest = require("../models/MessageRequest");
 const Conversation = require("../models/Conversation");
 const Message = require("../models/Message");
 const verifyFirebaseToken = require("../middleware/verifyFirebaseToken");
+const { sendNotification } = require("../utils/notify");
 
 const router = express.Router();
 
 function makeParticipantsKey(uidA, uidB) {
   return [uidA, uidB].sort().join("::");
 }
+
+// 0A. POST /api/inbox/fcm-token -> Save device push token for logged-in user
+router.post("/inbox/fcm-token", verifyFirebaseToken, async (req, res) => {
+  try {
+    const token = (req.body?.token || "").toString().trim();
+    if (!token) {
+      return res.status(400).json({ message: "FCM token is required." });
+    }
+
+    // Ensure this device token isn't attached to another account on the same phone
+    await User.updateMany(
+      { firebaseUid: { $ne: req.firebaseUid }, fcmTokens: token },
+      { $pull: { fcmTokens: token } }
+    );
+
+    await User.updateOne(
+      { firebaseUid: req.firebaseUid },
+      { $addToSet: { fcmTokens: token } }
+    );
+
+    return res.status(200).json({ message: "FCM token registered" });
+  } catch (err) {
+    console.error("Save FCM token error:", err);
+    return res.status(500).json({ message: "Could not register push token" });
+  }
+});
+
+// 0B. DELETE /api/inbox/fcm-token -> Remove device push token on logout
+router.delete("/inbox/fcm-token", verifyFirebaseToken, async (req, res) => {
+  try {
+    const token = (req.body?.token || "").toString().trim();
+    if (token) {
+      await User.updateOne(
+        { firebaseUid: req.firebaseUid },
+        { $pull: { fcmTokens: token } }
+      );
+    }
+    return res.status(200).json({ message: "FCM token removed" });
+  } catch (err) {
+    console.error("Remove FCM token error:", err);
+    return res.status(500).json({ message: "Could not remove push token" });
+  }
+});
 
 // 1. GET /api/inbox/notifications -> Notification list (with live request status)
 router.get("/inbox/notifications", verifyFirebaseToken, async (req, res) => {
@@ -64,20 +108,24 @@ router.get("/inbox/notifications", verifyFirebaseToken, async (req, res) => {
 });
 
 // 2. PATCH /api/inbox/notifications/read -> Mark all notifications as read
-router.patch("/inbox/notifications/read", verifyFirebaseToken, async (req, res) => {
-  try {
-    await Notification.updateMany(
-      { recipientUid: req.firebaseUid, isRead: false },
-      { $set: { isRead: true } }
-    );
-    return res.status(200).json({ message: "Notifications marked as read" });
-  } catch (err) {
-    console.error("Mark notifications read error:", err);
-    return res.status(500).json({ message: "Could not update notifications" });
+router.patch(
+  "/inbox/notifications/read",
+  verifyFirebaseToken,
+  async (req, res) => {
+    try {
+      await Notification.updateMany(
+        { recipientUid: req.firebaseUid, isRead: false },
+        { $set: { isRead: true } }
+      );
+      return res.status(200).json({ message: "Notifications marked as read" });
+    } catch (err) {
+      console.error("Mark notifications read error:", err);
+      return res.status(500).json({ message: "Could not update notifications" });
+    }
   }
-});
+);
 
-// 3. GET /api/inbox/message-requests/status/:targetUid -> Check chat/request status with a user
+// 3. GET /api/inbox/message-requests/status/:targetUid
 router.get(
   "/inbox/message-requests/status/:targetUid",
   verifyFirebaseToken,
@@ -131,7 +179,7 @@ router.get(
   }
 );
 
-// 4. POST /api/inbox/message-requests -> Send a message request to another user
+// 4. POST /api/inbox/message-requests -> Send a message request
 router.post("/inbox/message-requests", verifyFirebaseToken, async (req, res) => {
   try {
     const myUid = req.firebaseUid;
@@ -150,7 +198,6 @@ router.post("/inbox/message-requests", verifyFirebaseToken, async (req, res) => 
       return res.status(404).json({ message: "User not found." });
     }
 
-    // If they already have an active conversation, return it immediately
     const key = makeParticipantsKey(myUid, toUid);
     const existingConvo = await Conversation.findOne({ participantsKey: key });
     if (existingConvo) {
@@ -182,14 +229,15 @@ router.post("/inbox/message-requests", verifyFirebaseToken, async (req, res) => 
       });
     }
 
-    await Notification.create({
+    await sendNotification({
       recipientUid: toUid,
       actorUid: myUid,
       actorAlias: me.alias,
       actorAvatarId: me.avatarId || "avatar_01",
       type: "message_request",
-      referenceId: request._id.toString(),
+      title: "New Message Request",
       message: `${me.alias} sent you a message request.`,
+      referenceId: request._id.toString(),
     });
 
     return res.status(201).json({
@@ -203,14 +251,14 @@ router.post("/inbox/message-requests", verifyFirebaseToken, async (req, res) => 
   }
 });
 
-// 5. POST /api/inbox/message-requests/:requestId/respond -> Accept or Decline request
+// 5. POST /api/inbox/message-requests/:requestId/respond -> Accept or Decline
 router.post(
   "/inbox/message-requests/:requestId/respond",
   verifyFirebaseToken,
   async (req, res) => {
     try {
       const myUid = req.firebaseUid;
-      const { action } = req.body; // "accept" | "decline"
+      const { action } = req.body;
 
       if (!["accept", "decline"].includes(action)) {
         return res
@@ -238,7 +286,6 @@ router.post(
         return res.status(200).json({ status: "declined" });
       }
 
-      // Accept -> create (or reuse) conversation for BOTH users
       request.status = "accepted";
       await request.save();
 
@@ -260,14 +307,15 @@ router.post(
 
       const me = await User.findOne({ firebaseUid: myUid });
       if (me) {
-        await Notification.create({
+        await sendNotification({
           recipientUid: request.fromUid,
           actorUid: myUid,
           actorAlias: me.alias,
           actorAvatarId: me.avatarId || "avatar_01",
           type: "request_accepted",
-          referenceId: convo._id.toString(),
+          title: "Request Accepted",
           message: `${me.alias} accepted your message request. You can now chat!`,
+          referenceId: convo._id.toString(),
         });
       }
 
@@ -282,7 +330,7 @@ router.post(
   }
 );
 
-// 6. GET /api/inbox/conversations -> All active chats for the logged-in user
+// 6. GET /api/inbox/conversations -> All active chats
 router.get("/inbox/conversations", verifyFirebaseToken, async (req, res) => {
   try {
     const myUid = req.firebaseUid;
@@ -294,9 +342,9 @@ router.get("/inbox/conversations", verifyFirebaseToken, async (req, res) => {
       .map((c) => c.participants.find((uid) => uid !== myUid))
       .filter(Boolean);
 
-    const otherUsers = await User.find({ firebaseUid: { $in: otherUids } }).select(
-      "firebaseUid alias avatarId"
-    );
+    const otherUsers = await User.find({
+      firebaseUid: { $in: otherUids },
+    }).select("firebaseUid alias avatarId");
     const userMap = {};
     for (const u of otherUsers) {
       userMap[u.firebaseUid] = u;
@@ -325,7 +373,7 @@ router.get("/inbox/conversations", verifyFirebaseToken, async (req, res) => {
   }
 });
 
-// 7. GET /api/inbox/conversations/:conversationId/messages -> Load chat history
+// 7. GET /api/inbox/conversations/:conversationId/messages
 router.get(
   "/inbox/conversations/:conversationId/messages",
   verifyFirebaseToken,
@@ -361,7 +409,7 @@ router.get(
   }
 );
 
-// 8. POST /api/inbox/conversations/:conversationId/messages -> Send a chat message
+// 8. POST /api/inbox/conversations/:conversationId/messages -> Send message + notify
 router.post(
   "/inbox/conversations/:conversationId/messages",
   verifyFirebaseToken,
@@ -393,6 +441,24 @@ router.post(
       convo.lastSenderUid = myUid;
       convo.lastMessageAt = created.createdAt;
       await convo.save();
+
+      // Notify the other person in the chat
+      const otherUid = convo.participants.find((uid) => uid !== myUid);
+      const me = await User.findOne({ firebaseUid: myUid });
+      if (otherUid && me) {
+        const preview =
+          cleanText.length > 70 ? `${cleanText.slice(0, 70)}...` : cleanText;
+        await sendNotification({
+          recipientUid: otherUid,
+          actorUid: myUid,
+          actorAlias: me.alias,
+          actorAvatarId: me.avatarId || "avatar_01",
+          type: "message",
+          title: `New message from ${me.alias}`,
+          message: `${me.alias}: ${preview}`,
+          referenceId: convo._id.toString(),
+        });
+      }
 
       return res.status(201).json({
         message: {

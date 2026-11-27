@@ -18,6 +18,8 @@ const commentSchema = new mongoose.Schema(
     alias: { type: String, required: true, trim: true },
     avatarId: { type: String, default: "avatar_01" },
     body: { type: String, required: true, trim: true, maxlength: 1000 },
+    upvotedBy: { type: [String], default: [] },
+    downvotedBy: { type: [String], default: [] },
     reactions: {
       helpful: { type: [String], default: [] },
       heart: { type: [String], default: [] },

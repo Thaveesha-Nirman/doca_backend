@@ -3,6 +3,12 @@ const Post = require("../models/Post");
 const Share = require("../models/Share");
 const User = require("../models/User");
 const verifyFirebaseToken = require("../middleware/verifyFirebaseToken");
+const { sendNotification } = require("../utils/notify");
+const {
+  parseSearchFilters,
+  evaluatePostMatch,
+  sortFeedEntries,
+} = require("../utils/symptomSearch");
 
 const router = express.Router();
 
@@ -27,11 +33,13 @@ function optionalAuth(req, _res, next) {
   return verifyFirebaseToken(req, mockRes, next);
 }
 
-function escapeRegex(text) {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function formatPost(post, currentUid = null, rootCountsMap = {}, shareDoc = null) {
+function formatPost(
+  post,
+  currentUid = null,
+  rootCountsMap = {},
+  shareDoc = null,
+  matchInfo = null
+) {
   const id = post._id.toString();
   const rootId = post.journeyRootId ? post.journeyRootId.toString() : id;
   const totalSteps = rootCountsMap[rootId] || post.journeyCount || 1;
@@ -67,6 +75,8 @@ function formatPost(post, currentUid = null, rootCountsMap = {}, shareDoc = null
     sharesCount: sharedBy.length,
     isSharedByMe: currentUid ? sharedBy.includes(currentUid) : false,
     isOwner: currentUid ? post.authorUid === currentUid : false,
+    matchScore: matchInfo ? matchInfo.score : 0,
+    matchedTerms: matchInfo ? matchInfo.matchedTerms : [],
     sharedBy: shareDoc
       ? {
           id: shareDoc._id.toString(),
@@ -105,68 +115,86 @@ async function buildRootCountsMap(posts) {
   return map;
 }
 
-// 1. GET /api/posts?tab=forYou&q=searchText
+async function buildFilteredFeed({
+  postQuery = {},
+  shareQuery = {},
+  filters,
+  currentUid,
+}) {
+  const fetchLimit = filters.hasAnyFilter ? 200 : 50;
+
+  const [originalPosts, rawShares] = await Promise.all([
+    Post.find(postQuery).sort({ createdAt: -1 }).limit(fetchLimit),
+    // When actively searching/filtering symptoms, return clean unique posts without duplicate share cards
+    filters.hasAnyFilter
+      ? Promise.resolve([])
+      : Share.find(shareQuery)
+          .sort({ sharedAt: -1, createdAt: -1 })
+          .limit(50)
+          .populate("postId"),
+  ]);
+
+  const validShares = rawShares.filter((s) => s.postId);
+  const allUnderlyingPosts = [
+    ...originalPosts,
+    ...validShares.map((s) => s.postId),
+  ];
+  const countsMap = await buildRootCountsMap(allUnderlyingPosts);
+
+  const feedEntries = [];
+
+  for (const p of originalPosts) {
+    const rootId = p.journeyRootId ? p.journeyRootId.toString() : p._id.toString();
+    const totalSteps = countsMap[rootId] || p.journeyCount || 1;
+    const matchInfo = evaluatePostMatch(p, totalSteps, filters);
+    if (!matchInfo) continue;
+
+    feedEntries.push({
+      score: matchInfo.score,
+      sortTime: new Date(p.createdAt).getTime(),
+      item: formatPost(p, currentUid, countsMap, null, matchInfo),
+    });
+  }
+
+  for (const s of validShares) {
+    const p = s.postId;
+    const rootId = p.journeyRootId ? p.journeyRootId.toString() : p._id.toString();
+    const totalSteps = countsMap[rootId] || p.journeyCount || 1;
+    const matchInfo = evaluatePostMatch(p, totalSteps, filters, s.caption);
+    if (!matchInfo) continue;
+
+    feedEntries.push({
+      score: matchInfo.score,
+      sortTime: new Date(s.sharedAt || s.createdAt).getTime(),
+      item: formatPost(p, currentUid, countsMap, s, matchInfo),
+    });
+  }
+
+  sortFeedEntries(feedEntries, filters.sort);
+  return feedEntries.slice(0, 50).map((entry) => entry.item);
+}
+
+// 1. GET /api/posts?q=&status=&symptoms=&bodyArea=&hasPhotos=&onlyJourneys=&sort=
 router.get("/posts", optionalAuth, async (req, res) => {
   try {
-    const q = (req.query.q || "").toString().trim();
-    const postFilter = {};
-
-    let searchRegex = null;
-    if (q.length > 0) {
-      searchRegex = new RegExp(escapeRegex(q), "i");
-      postFilter.$or = [{ title: searchRegex }, { body: searchRegex }];
-    }
-
-    const [originalPosts, rawShares] = await Promise.all([
-      Post.find(postFilter).sort({ createdAt: -1 }).limit(50),
-      Share.find({})
-        .sort({ sharedAt: -1, createdAt: -1 })
-        .limit(50)
-        .populate("postId"),
-    ]);
-
-    const validShares = rawShares.filter((s) => {
-      if (!s.postId) return false;
-      if (!searchRegex) return true;
-      return (
-        searchRegex.test(s.postId.title || "") ||
-        searchRegex.test(s.postId.body || "") ||
-        searchRegex.test(s.caption || "")
-      );
+    const filters = parseSearchFilters(req.query);
+    const posts = await buildFilteredFeed({
+      postQuery: {},
+      shareQuery: {},
+      filters,
+      currentUid: req.firebaseUid,
     });
 
-    const allUnderlyingPosts = [
-      ...originalPosts,
-      ...validShares.map((s) => s.postId),
-    ];
-    const countsMap = await buildRootCountsMap(allUnderlyingPosts);
-
-    const feedEntries = [
-      ...originalPosts.map((p) => ({
-        sortTime: new Date(p.createdAt).getTime(),
-        item: formatPost(p, req.firebaseUid, countsMap, null),
-      })),
-      ...validShares.map((s) => ({
-        sortTime: new Date(s.sharedAt || s.createdAt).getTime(),
-        item: formatPost(s.postId, req.firebaseUid, countsMap, s),
-      })),
-    ];
-
-    feedEntries.sort((a, b) => b.sortTime - a.sortTime);
-
-    return res.status(200).json({
-      posts: feedEntries.slice(0, 50).map((entry) => entry.item),
-    });
+    return res.status(200).json({ posts });
   } catch (err) {
     console.error("Fetch posts error:", err);
     return res.status(500).json({ message: "Could not load community feed" });
   }
 });
 
-// 1B. GET /api/posts/following -> Strict auth
+// 1B. GET /api/posts/following -> Strict auth + full symptom search & filters
 router.get("/posts/following", verifyFirebaseToken, async (req, res) => {
   try {
-    const q = (req.query.q || "").toString().trim();
     const me = await User.findOne({ firebaseUid: req.firebaseUid });
     const followingList =
       me && Array.isArray(me.following) ? me.following : [];
@@ -175,55 +203,15 @@ router.get("/posts/following", verifyFirebaseToken, async (req, res) => {
       return res.status(200).json({ posts: [] });
     }
 
-    const postFilter = { authorUid: { $in: followingList } };
-    const shareFilter = { sharerUid: { $in: followingList } };
-
-    let searchRegex = null;
-    if (q.length > 0) {
-      searchRegex = new RegExp(escapeRegex(q), "i");
-      postFilter.$or = [{ title: searchRegex }, { body: searchRegex }];
-    }
-
-    const [originalPosts, rawShares] = await Promise.all([
-      Post.find(postFilter).sort({ createdAt: -1 }).limit(50),
-      Share.find(shareFilter)
-        .sort({ sharedAt: -1, createdAt: -1 })
-        .limit(50)
-        .populate("postId"),
-    ]);
-
-    const validShares = rawShares.filter((s) => {
-      if (!s.postId) return false;
-      if (!searchRegex) return true;
-      return (
-        searchRegex.test(s.postId.title || "") ||
-        searchRegex.test(s.postId.body || "") ||
-        searchRegex.test(s.caption || "")
-      );
+    const filters = parseSearchFilters(req.query);
+    const posts = await buildFilteredFeed({
+      postQuery: { authorUid: { $in: followingList } },
+      shareQuery: { sharerUid: { $in: followingList } },
+      filters,
+      currentUid: req.firebaseUid,
     });
 
-    const allUnderlyingPosts = [
-      ...originalPosts,
-      ...validShares.map((s) => s.postId),
-    ];
-    const countsMap = await buildRootCountsMap(allUnderlyingPosts);
-
-    const feedEntries = [
-      ...originalPosts.map((p) => ({
-        sortTime: new Date(p.createdAt).getTime(),
-        item: formatPost(p, req.firebaseUid, countsMap, null),
-      })),
-      ...validShares.map((s) => ({
-        sortTime: new Date(s.sharedAt || s.createdAt).getTime(),
-        item: formatPost(s.postId, req.firebaseUid, countsMap, s),
-      })),
-    ];
-
-    feedEntries.sort((a, b) => b.sortTime - a.sortTime);
-
-    return res.status(200).json({
-      posts: feedEntries.slice(0, 50).map((entry) => entry.item),
-    });
+    return res.status(200).json({ posts });
   } catch (err) {
     console.error("Fetch following feed error:", err);
     return res.status(500).json({ message: "Could not load following feed" });
@@ -411,7 +399,7 @@ router.post("/posts", verifyFirebaseToken, async (req, res) => {
   }
 });
 
-// 6. PATCH /api/posts/:id -> Edit title, body, status, images, isSensitive
+// 6. PATCH /api/posts/:id
 router.patch("/posts/:id", verifyFirebaseToken, async (req, res) => {
   try {
     const post = await Post.findById(req.params.id);
@@ -453,7 +441,7 @@ router.patch("/posts/:id", verifyFirebaseToken, async (req, res) => {
   }
 });
 
-// 7. DELETE /api/posts/:id -> Delete original post (and any shares pointing to it)
+// 7. DELETE /api/posts/:id
 router.delete("/posts/:id", verifyFirebaseToken, async (req, res) => {
   try {
     const post = await Post.findById(req.params.id);
@@ -513,13 +501,33 @@ router.patch("/posts/:id/vote", verifyFirebaseToken, async (req, res) => {
     post.upvotedBy = upList.filter((id) => id !== uid);
     post.downvotedBy = downList.filter((id) => id !== uid);
 
-    if (type === "up" && !hasUp) {
+    const newlyUpvoted = type === "up" && !hasUp;
+    if (newlyUpvoted) {
       post.upvotedBy.push(uid);
     } else if (type === "down" && !hasDown) {
       post.downvotedBy.push(uid);
     }
 
     await post.save();
+
+    if (newlyUpvoted) {
+      const me = await User.findOne({ firebaseUid: uid });
+      if (me) {
+        const shortTitle =
+          post.title.length > 45 ? `${post.title.slice(0, 45)}...` : post.title;
+        await sendNotification({
+          recipientUid: post.authorUid,
+          actorUid: uid,
+          actorAlias: me.alias,
+          actorAvatarId: me.avatarId || "avatar_01",
+          type: "post_upvote",
+          title: "New Upvote",
+          message: `${me.alias} upvoted your post "${shortTitle}"`,
+          referenceId: post._id.toString(),
+        });
+      }
+    }
+
     const countsMap = await buildRootCountsMap([post]);
 
     return res.status(200).json({
@@ -531,7 +539,7 @@ router.patch("/posts/:id/vote", verifyFirebaseToken, async (req, res) => {
   }
 });
 
-// 9. POST /api/posts/:id/share -> Facebook-style share with optional caption
+// 9. POST /api/posts/:id/share
 router.post("/posts/:id/share", verifyFirebaseToken, async (req, res) => {
   try {
     const [post, user] = await Promise.all([
@@ -553,7 +561,8 @@ router.post("/posts/:id/share", verifyFirebaseToken, async (req, res) => {
         : "";
 
     const shareList = Array.isArray(post.sharedBy) ? post.sharedBy : [];
-    if (!shareList.includes(uid)) {
+    const alreadyShared = shareList.includes(uid);
+    if (!alreadyShared) {
       post.sharedBy = [...shareList, uid];
       await post.save();
     }
@@ -571,6 +580,21 @@ router.post("/posts/:id/share", verifyFirebaseToken, async (req, res) => {
       { upsert: true, new: true }
     );
 
+    if (!alreadyShared) {
+      const shortTitle =
+        post.title.length > 45 ? `${post.title.slice(0, 45)}...` : post.title;
+      await sendNotification({
+        recipientUid: post.authorUid,
+        actorUid: uid,
+        actorAlias: user.alias,
+        actorAvatarId: user.avatarId || "avatar_01",
+        type: "post_share",
+        title: "Post Shared",
+        message: `${user.alias} shared your post "${shortTitle}"`,
+        referenceId: post._id.toString(),
+      });
+    }
+
     const countsMap = await buildRootCountsMap([post]);
 
     return res.status(200).json({
@@ -583,7 +607,28 @@ router.post("/posts/:id/share", verifyFirebaseToken, async (req, res) => {
   }
 });
 
-// 10. PATCH /api/shares/:shareId -> Edit the caption of your shared post
+// 9B. DELETE /api/posts/:id/share
+router.delete("/posts/:id/share", verifyFirebaseToken, async (req, res) => {
+  try {
+    const postId = req.params.id;
+    const uid = req.firebaseUid;
+
+    await Promise.all([
+      Share.deleteMany({ sharerUid: uid, postId }),
+      Post.findByIdAndUpdate(postId, { $pull: { sharedBy: uid } }),
+    ]);
+
+    return res.status(200).json({
+      shared: false,
+      message: "Shared post removed",
+    });
+  } catch (err) {
+    console.error("Unshare post error:", err);
+    return res.status(500).json({ message: "Could not remove shared post" });
+  }
+});
+
+// 10. PATCH /api/shares/:shareId
 router.patch("/shares/:shareId", verifyFirebaseToken, async (req, res) => {
   try {
     const { shareId } = req.params;
@@ -593,7 +638,6 @@ router.patch("/shares/:shareId", verifyFirebaseToken, async (req, res) => {
         ? req.body.caption.trim().slice(0, 500)
         : "";
 
-    // Support upgrading older legacy shares seamlessly
     if (shareId.startsWith("legacy_")) {
       const postId = shareId.replace("legacy_", "");
       const [post, user] = await Promise.all([
@@ -644,7 +688,7 @@ router.patch("/shares/:shareId", verifyFirebaseToken, async (req, res) => {
   }
 });
 
-// 11. DELETE /api/shares/:shareId -> Delete your shared post (keeps original post intact)
+// 11. DELETE /api/shares/:shareId
 router.delete("/shares/:shareId", verifyFirebaseToken, async (req, res) => {
   try {
     const { shareId } = req.params;
