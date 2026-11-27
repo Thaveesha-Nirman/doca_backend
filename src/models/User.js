@@ -3,14 +3,13 @@ const mongoose = require("mongoose");
 const userSchema = new mongoose.Schema(
   {
     firebaseUid: { type: String, required: true, unique: true, index: true },
-    alias: { type: String, required: true, trim: true, unique: true },
+    alias: { type: String, required: true, unique: true, trim: true },
     avatarId: { type: String, default: "avatar_01" },
-    gender: {
-      type: String,
-      enum: ["Male", "Female", "Prefer not to say"],
-      default: "Prefer not to say",
-    },
-    age: { type: Number, min: 13, max: 120, default: null },
+    gender: { type: String, default: "Prefer not to say" },
+    age: { type: Number, min: 13, max: 120 },
+    bio: { type: String, default: "", trim: true, maxlength: 200 },
+    followers: { type: [String], default: [] }, // array of firebaseUids
+    following: { type: [String], default: [] }, // array of firebaseUids
   },
   { timestamps: true }
 );
