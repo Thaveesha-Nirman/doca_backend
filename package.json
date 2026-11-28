@@ -1,27 +1,31 @@
 {
-  "name": "skinit_backend",
+  "name": "doca_backend",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Privacy-first API for the DOCA skin condition support app",
+  "main": "src/server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test",
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "seed:conditions": "node src/scripts/seedConditions.js"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Thaveesha-Nirman/skinit_backend.git"
+    "url": "git+https://github.com/Thaveesha-Nirman/doca_backend.git"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "bugs": {
-    "url": "https://github.com/Thaveesha-Nirman/skinit_backend/issues"
+    "url": "https://github.com/Thaveesha-Nirman/doca_backend/issues"
   },
-  "homepage": "https://github.com/Thaveesha-Nirman/skinit_backend#readme",
+  "homepage": "https://github.com/Thaveesha-Nirman/doca_backend#readme",
   "dependencies": {
     "cors": "^2.8.6",
-    "dotenv": "^18.0.9",
+    "dotenv": "^18.0.10",
     "express": "^5.3.0",
+    "firebase-admin": "^14.5.1",
     "mongoose": "^9.12.0"
   }
 }
