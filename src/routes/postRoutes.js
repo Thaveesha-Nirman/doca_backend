@@ -310,6 +310,28 @@ router.get("/posts/:id/journey", optionalAuth, async (req, res) => {
     return res.status(500).json({ message: "Could not load journey timeline" });
   }
 });
+// 4B. GET /api/posts/:id -> Fetch a single clean original post by ID
+router.get("/posts/:id", optionalAuth, async (req, res) => {
+  try {
+    const postId = req.params.id;
+    if (!/^[a-f\d]{24}$/i.test(postId)) {
+      return res.status(404).json({ message: "Post not found" });
+    }
+
+    const post = await Post.findById(postId);
+    if (!post) {
+      return res.status(404).json({ message: "Post not found" });
+    }
+
+    const countsMap = await buildRootCountsMap([post]);
+    return res.status(200).json({
+      post: formatPost(post, req.firebaseUid, countsMap, null),
+    });
+  } catch (err) {
+    console.error("Fetch single post error:", err);
+    return res.status(500).json({ message: "Could not load post" });
+  }
+});
 
 // 5. POST /api/posts
 router.post("/posts", verifyFirebaseToken, async (req, res) => {
