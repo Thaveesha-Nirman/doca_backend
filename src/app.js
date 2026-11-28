@@ -13,8 +13,7 @@ const app = express();
 
 app.disable("x-powered-by");
 app.use(cors());
-app.use(express.json({ limit: "10mb" }));
-
+app.use(express.json({ limit: "15mb" }));
 app.use("/api/v1", apiRouter);
 app.use("/api", authRoutes);
 app.use("/api", postRoutes);

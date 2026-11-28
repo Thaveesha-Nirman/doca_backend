@@ -6,14 +6,81 @@ const Conversation = require("../models/Conversation");
 const Message = require("../models/Message");
 const verifyFirebaseToken = require("../middleware/verifyFirebaseToken");
 const { sendNotification } = require("../utils/notify");
+const { encryptText, decryptText } = require("../utils/chatCrypto");
 
 const router = express.Router();
+
+const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024; // 5 MB raw limit
 
 function makeParticipantsKey(uidA, uidB) {
   return [uidA, uidB].sort().join("::");
 }
 
-// 0A. POST /api/inbox/fcm-token -> Save device push token for logged-in user
+function formatMessage(m, currentUid) {
+  const deleted = Boolean(m.isDeleted);
+  return {
+    id: m._id.toString(),
+    conversationId: m.conversationId.toString(),
+    senderUid: m.senderUid,
+    isMine: m.senderUid === currentUid,
+    body: deleted ? "" : decryptText(m.body || ""),
+    attachment:
+      deleted || !m.attachment
+        ? null
+        : {
+            type: m.attachment.type,
+            name: decryptText(m.attachment.name || "document"),
+            mimeType: m.attachment.mimeType || "application/octet-stream",
+            size: m.attachment.size || 0,
+            data: decryptText(m.attachment.data || ""),
+          },
+    isEdited: Boolean(m.isEdited) && !deleted,
+    editedAt: deleted ? null : m.editedAt || null,
+    isDeleted: deleted,
+    deliveredAt: m.deliveredAt || m.seenAt || null,
+    seenAt: m.seenAt || null,
+    createdAt: m.createdAt,
+  };
+}
+
+function buildPreviewText(plainBody, plainAttachment) {
+  if (plainBody && plainBody.trim().length > 0) {
+    return plainBody.trim();
+  }
+  if (plainAttachment?.type === "image") {
+    return "📷 Photo";
+  }
+  if (plainAttachment?.type === "file") {
+    return `📎 ${plainAttachment.name || "Document"}`;
+  }
+  return "";
+}
+
+async function markIncomingDeliveredAndCountUnread(myUid) {
+  const myConvos = await Conversation.find({ participants: myUid }).select(
+    "_id"
+  );
+  const convoIds = myConvos.map((c) => c._id);
+  if (convoIds.length === 0) return 0;
+
+  await Message.updateMany(
+    {
+      conversationId: { $in: convoIds },
+      senderUid: { $ne: myUid },
+      deliveredAt: null,
+    },
+    { $set: { deliveredAt: new Date() } }
+  );
+
+  return Message.countDocuments({
+    conversationId: { $in: convoIds },
+    senderUid: { $ne: myUid },
+    seenAt: null,
+    isDeleted: { $ne: true },
+  });
+}
+
+// 0A. POST /api/inbox/fcm-token -> Save device push token
 router.post("/inbox/fcm-token", verifyFirebaseToken, async (req, res) => {
   try {
     const token = (req.body?.token || "").toString().trim();
@@ -21,7 +88,6 @@ router.post("/inbox/fcm-token", verifyFirebaseToken, async (req, res) => {
       return res.status(400).json({ message: "FCM token is required." });
     }
 
-    // Ensure this device token isn't attached to another account on the same phone
     await User.updateMany(
       { firebaseUid: { $ne: req.firebaseUid }, fcmTokens: token },
       { $pull: { fcmTokens: token } }
@@ -56,14 +122,15 @@ router.delete("/inbox/fcm-token", verifyFirebaseToken, async (req, res) => {
   }
 });
 
-// 1. GET /api/inbox/notifications -> Notification list (with live request status)
+// 1. GET /api/inbox/notifications -> Also marks incoming messages delivered & returns unreadMessagesCount
 router.get("/inbox/notifications", verifyFirebaseToken, async (req, res) => {
   try {
-    const notifications = await Notification.find({
-      recipientUid: req.firebaseUid,
-    })
-      .sort({ createdAt: -1 })
-      .limit(50);
+    const [notifications, unreadMessagesCount] = await Promise.all([
+      Notification.find({ recipientUid: req.firebaseUid })
+        .sort({ createdAt: -1 })
+        .limit(50),
+      markIncomingDeliveredAndCountUnread(req.firebaseUid),
+    ]);
 
     const requestIds = notifications
       .filter((n) => n.type === "message_request" && n.referenceId)
@@ -99,6 +166,7 @@ router.get("/inbox/notifications", verifyFirebaseToken, async (req, res) => {
 
     return res.status(200).json({
       unreadCount,
+      unreadMessagesCount,
       notifications: formatted,
     });
   } catch (err) {
@@ -107,7 +175,7 @@ router.get("/inbox/notifications", verifyFirebaseToken, async (req, res) => {
   }
 });
 
-// 2. PATCH /api/inbox/notifications/read -> Mark all notifications as read
+// 2. PATCH /api/inbox/notifications/read
 router.patch(
   "/inbox/notifications/read",
   verifyFirebaseToken,
@@ -179,7 +247,7 @@ router.get(
   }
 );
 
-// 4. POST /api/inbox/message-requests -> Send a message request
+// 4. POST /api/inbox/message-requests
 router.post("/inbox/message-requests", verifyFirebaseToken, async (req, res) => {
   try {
     const myUid = req.firebaseUid;
@@ -251,7 +319,7 @@ router.post("/inbox/message-requests", verifyFirebaseToken, async (req, res) => 
   }
 });
 
-// 5. POST /api/inbox/message-requests/:requestId/respond -> Accept or Decline
+// 5. POST /api/inbox/message-requests/:requestId/respond
 router.post(
   "/inbox/message-requests/:requestId/respond",
   verifyFirebaseToken,
@@ -295,7 +363,7 @@ router.post(
         convo = await Conversation.create({
           participants: [request.fromUid, request.toUid].sort(),
           participantsKey: key,
-          lastMessageText: "Message request accepted. Say hello!",
+          lastMessageText: encryptText("Message request accepted. Say hello!"),
           lastMessageAt: new Date(),
         });
       }
@@ -330,13 +398,51 @@ router.post(
   }
 );
 
-// 6. GET /api/inbox/conversations -> All active chats
+// 6. GET /api/inbox/conversations -> Marks incoming delivered + returns per-chat unreadCount
 router.get("/inbox/conversations", verifyFirebaseToken, async (req, res) => {
   try {
     const myUid = req.firebaseUid;
     const convos = await Conversation.find({ participants: myUid }).sort({
       lastMessageAt: -1,
     });
+
+    const convoIds = convos.map((c) => c._id);
+
+    // Mark incoming messages as delivered now that recipient synced Inbox
+    if (convoIds.length > 0) {
+      await Message.updateMany(
+        {
+          conversationId: { $in: convoIds },
+          senderUid: { $ne: myUid },
+          deliveredAt: null,
+        },
+        { $set: { deliveredAt: new Date() } }
+      );
+    }
+
+    // Count unread messages per conversation
+    const unreadAgg =
+      convoIds.length > 0
+        ? await Message.aggregate([
+            {
+              $match: {
+                conversationId: { $in: convoIds },
+                senderUid: { $ne: myUid },
+                seenAt: null,
+                isDeleted: { $ne: true },
+              },
+            },
+            { $group: { _id: "$conversationId", count: { $sum: 1 } } },
+          ])
+        : [];
+
+    const unreadMap = {};
+    let totalUnreadMessages = 0;
+    for (const row of unreadAgg) {
+      const cid = row._id.toString();
+      unreadMap[cid] = row.count;
+      totalUnreadMessages += row.count;
+    }
 
     const otherUids = convos
       .map((c) => c.participants.find((uid) => uid !== myUid))
@@ -351,29 +457,34 @@ router.get("/inbox/conversations", verifyFirebaseToken, async (req, res) => {
     }
 
     const formatted = convos.map((c) => {
+      const cid = c._id.toString();
       const otherUid = c.participants.find((uid) => uid !== myUid) || "";
       const other = userMap[otherUid];
       return {
-        id: c._id.toString(),
+        id: cid,
         otherUser: {
           uid: otherUid,
           alias: other ? other.alias : "Anonymous",
           avatarId: other ? other.avatarId || "avatar_01" : "avatar_01",
         },
-        lastMessageText: c.lastMessageText || "",
+        lastMessageText: decryptText(c.lastMessageText || ""),
         lastSenderUid: c.lastSenderUid,
         lastMessageAt: c.lastMessageAt,
+        unreadCount: unreadMap[cid] || 0,
       };
     });
 
-    return res.status(200).json({ conversations: formatted });
+    return res.status(200).json({
+      totalUnreadMessages,
+      conversations: formatted,
+    });
   } catch (err) {
     console.error("Fetch conversations error:", err);
     return res.status(500).json({ message: "Could not load conversations" });
   }
 });
 
-// 7. GET /api/inbox/conversations/:conversationId/messages
+// 7. GET /api/inbox/conversations/:conversationId/messages -> Marks Delivered + Seen & decrypts
 router.get(
   "/inbox/conversations/:conversationId/messages",
   verifyFirebaseToken,
@@ -388,19 +499,35 @@ router.get(
         return res.status(403).json({ message: "Access denied." });
       }
 
-      const messages = await Message.find({ conversationId: convo._id })
-        .sort({ createdAt: 1 })
+      const now = new Date();
+
+      // Ensure deliveredAt is set for any undelivered incoming messages
+      await Message.updateMany(
+        {
+          conversationId: convo._id,
+          senderUid: { $ne: myUid },
+          deliveredAt: null,
+        },
+        { $set: { deliveredAt: now } }
+      );
+
+      // Mark all unseen incoming messages as seen
+      await Message.updateMany(
+        {
+          conversationId: convo._id,
+          senderUid: { $ne: myUid },
+          seenAt: null,
+        },
+        { $set: { seenAt: now } }
+      );
+
+      const latest = await Message.find({ conversationId: convo._id })
+        .sort({ createdAt: -1 })
         .limit(100);
+      latest.reverse();
 
       return res.status(200).json({
-        messages: messages.map((m) => ({
-          id: m._id.toString(),
-          conversationId: m.conversationId.toString(),
-          senderUid: m.senderUid,
-          isMine: m.senderUid === myUid,
-          body: m.body,
-          createdAt: m.createdAt,
-        })),
+        messages: latest.map((m) => formatMessage(m, myUid)),
       });
     } catch (err) {
       console.error("Fetch messages error:", err);
@@ -409,17 +536,65 @@ router.get(
   }
 );
 
-// 8. POST /api/inbox/conversations/:conversationId/messages -> Send message + notify
+// 8. POST /api/inbox/conversations/:conversationId/messages -> Encrypts before saving to MongoDB
 router.post(
   "/inbox/conversations/:conversationId/messages",
   verifyFirebaseToken,
   async (req, res) => {
     try {
       const myUid = req.firebaseUid;
-      const { body } = req.body;
+      const cleanText =
+        typeof req.body?.body === "string"
+          ? req.body.body.trim().slice(0, 1500)
+          : "";
+      const rawAtt = req.body?.attachment || null;
 
-      if (!body || !body.trim()) {
-        return res.status(400).json({ message: "Message cannot be empty." });
+      let plainAttachment = null;
+      let encryptedAttachment = null;
+
+      if (rawAtt && typeof rawAtt === "object") {
+        const type = rawAtt.type === "image" ? "image" : "file";
+        const name = (
+          rawAtt.name || (type === "image" ? "photo.jpg" : "document.pdf")
+        )
+          .toString()
+          .trim()
+          .slice(0, 200);
+        const mimeType = (
+          rawAtt.mimeType ||
+          (type === "image" ? "image/jpeg" : "application/pdf")
+        )
+          .toString()
+          .trim();
+        const data = (rawAtt.data || "").toString().trim();
+
+        if (!data) {
+          return res
+            .status(400)
+            .json({ message: "Attachment data is empty." });
+        }
+
+        const approxBytes = Math.ceil((data.length * 3) / 4);
+        if (approxBytes > MAX_ATTACHMENT_BYTES) {
+          return res.status(413).json({
+            message: "Attachment is too large. Please keep files under 5 MB.",
+          });
+        }
+
+        plainAttachment = { type, name };
+        encryptedAttachment = {
+          type,
+          name: encryptText(name),
+          mimeType,
+          size: Number(rawAtt.size) || approxBytes,
+          data: encryptText(data),
+        };
+      }
+
+      if (!cleanText && !encryptedAttachment) {
+        return res
+          .status(400)
+          .json({ message: "Message or attachment is required." });
       }
 
       const convo = await Conversation.findById(req.params.conversationId);
@@ -430,24 +605,26 @@ router.post(
         return res.status(403).json({ message: "Access denied." });
       }
 
-      const cleanText = body.trim().slice(0, 1500);
       const created = await Message.create({
         conversationId: convo._id,
         senderUid: myUid,
-        body: cleanText,
+        body: encryptText(cleanText),
+        attachment: encryptedAttachment,
       });
 
-      convo.lastMessageText = cleanText;
+      const plainPreview = buildPreviewText(cleanText, plainAttachment);
+      convo.lastMessageText = encryptText(plainPreview);
       convo.lastSenderUid = myUid;
       convo.lastMessageAt = created.createdAt;
       await convo.save();
 
-      // Notify the other person in the chat
       const otherUid = convo.participants.find((uid) => uid !== myUid);
       const me = await User.findOne({ firebaseUid: myUid });
       if (otherUid && me) {
-        const preview =
-          cleanText.length > 70 ? `${cleanText.slice(0, 70)}...` : cleanText;
+        const shortPreview =
+          plainPreview.length > 70
+            ? `${plainPreview.slice(0, 70)}...`
+            : plainPreview;
         await sendNotification({
           recipientUid: otherUid,
           actorUid: myUid,
@@ -455,24 +632,120 @@ router.post(
           actorAvatarId: me.avatarId || "avatar_01",
           type: "message",
           title: `New message from ${me.alias}`,
-          message: `${me.alias}: ${preview}`,
+          message: `${me.alias}: ${shortPreview}`,
           referenceId: convo._id.toString(),
         });
       }
 
       return res.status(201).json({
-        message: {
-          id: created._id.toString(),
-          conversationId: created.conversationId.toString(),
-          senderUid: created.senderUid,
-          isMine: true,
-          body: created.body,
-          createdAt: created.createdAt,
-        },
+        message: formatMessage(created, myUid),
       });
     } catch (err) {
       console.error("Send message error:", err);
       return res.status(500).json({ message: "Could not send message" });
+    }
+  }
+);
+
+// 9. PATCH /api/inbox/messages/:messageId -> Edit (re-encrypts text)
+router.patch(
+  "/inbox/messages/:messageId",
+  verifyFirebaseToken,
+  async (req, res) => {
+    try {
+      const myUid = req.firebaseUid;
+      const cleanText =
+        typeof req.body?.body === "string"
+          ? req.body.body.trim().slice(0, 1500)
+          : "";
+
+      const msg = await Message.findById(req.params.messageId);
+      if (!msg) {
+        return res.status(404).json({ message: "Message not found." });
+      }
+      if (msg.senderUid !== myUid) {
+        return res
+          .status(403)
+          .json({ message: "You can only edit your own messages." });
+      }
+      if (msg.isDeleted) {
+        return res
+          .status(400)
+          .json({ message: "Deleted messages cannot be edited." });
+      }
+      if (!cleanText && !msg.attachment) {
+        return res.status(400).json({ message: "Message cannot be empty." });
+      }
+
+      msg.body = encryptText(cleanText);
+      msg.isEdited = true;
+      msg.editedAt = new Date();
+      await msg.save();
+
+      const latest = await Message.findOne({
+        conversationId: msg.conversationId,
+      }).sort({ createdAt: -1 });
+      if (latest && latest._id.equals(msg._id)) {
+        const plainAtt = msg.attachment
+          ? {
+              type: msg.attachment.type,
+              name: decryptText(msg.attachment.name || "Document"),
+            }
+          : null;
+        await Conversation.findByIdAndUpdate(msg.conversationId, {
+          $set: {
+            lastMessageText: encryptText(buildPreviewText(cleanText, plainAtt)),
+          },
+        });
+      }
+
+      return res.status(200).json({
+        message: formatMessage(msg, myUid),
+      });
+    } catch (err) {
+      console.error("Edit message error:", err);
+      return res.status(500).json({ message: "Could not edit message" });
+    }
+  }
+);
+
+// 10. DELETE /api/inbox/messages/:messageId -> Soft delete
+router.delete(
+  "/inbox/messages/:messageId",
+  verifyFirebaseToken,
+  async (req, res) => {
+    try {
+      const myUid = req.firebaseUid;
+      const msg = await Message.findById(req.params.messageId);
+      if (!msg) {
+        return res.status(404).json({ message: "Message not found." });
+      }
+      if (msg.senderUid !== myUid) {
+        return res
+          .status(403)
+          .json({ message: "You can only delete your own messages." });
+      }
+
+      msg.isDeleted = true;
+      msg.body = "";
+      msg.attachment = null;
+      await msg.save();
+
+      const latest = await Message.findOne({
+        conversationId: msg.conversationId,
+      }).sort({ createdAt: -1 });
+      if (latest && latest._id.equals(msg._id)) {
+        await Conversation.findByIdAndUpdate(msg.conversationId, {
+          $set: { lastMessageText: encryptText("This message was deleted") },
+        });
+      }
+
+      return res.status(200).json({
+        message: formatMessage(msg, myUid),
+      });
+    } catch (err) {
+      console.error("Delete message error:", err);
+      return res.status(500).json({ message: "Could not delete message" });
     }
   }
 );
